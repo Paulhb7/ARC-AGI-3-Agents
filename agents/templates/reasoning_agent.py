@@ -14,99 +14,84 @@ from .llm_agents import ReasoningLLM
 
 logger = logging.getLogger(__name__)
 
-
 class ReasoningActionResponse(BaseModel):
-    """Action response structure for reasoning agent."""
-
-    name: Literal["ACTION1", "ACTION2", "ACTION3", "ACTION4", "RESET"] = Field(
+    name: Literal["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "RESET"] = Field(
         description="The action to take."
     )
-    reason: str = Field(
-        description="Detailed reasoning for choosing this action",
+    aggregated_findings: str = Field(
+        description="Summary of discoveries and learnings so far.",
         min_length=10,
         max_length=2000,
     )
-    short_description: str = Field(
-        description="Brief description of the action", min_length=5, max_length=500
+    victory_hypothesis: str = Field(
+        description="Current best theory on how to win the level/game.",
+        min_length=10,
+        max_length=1000,
     )
     hypothesis: str = Field(
-        description="Current hypothesis about game mechanics",
+        description="Current hypothesis to test about game mechanics.",
         min_length=10,
         max_length=2000,
     )
-    aggregated_findings: str = Field(
-        description="Summary of discoveries and learnings so far",
+    plan: str = Field(
+        description="Plan in natural language: explain the actions you will do to test your hypothesis.",
         min_length=10,
-        max_length=2000,
+        max_length=1000,
     )
-
+    planned_actions: List[str] = Field(
+        description="Ordered list of action names to take for this experiment, e.g. ['ACTION1', 'ACTION1', 'ACTION4']"
+    )
+    score_progress: str = Field(
+        description="Describe whether your score increased after the last sequence, and what you believe caused it.",
+        min_length=5,
+        max_length=300,
+        default="No score progress detected."
+    )
 
 class ReasoningAgent(ReasoningLLM):
-    """A reasoning agent that tracks screen history and builds hypotheses about game rules."""
-
-    MAX_ACTIONS = 400
+    MAX_ACTIONS = 60
     DO_OBSERVATION = True
     MODEL = "o4-mini"
     MESSAGE_LIMIT = 5
     REASONING_EFFORT = "high"
-    ZONE_SIZE = 16
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.history: List[ReasoningActionResponse] = []
         self.screen_history: List[bytes] = []
-        self.max_screen_history = 10  # Limit screen history to prevent memory leak
+        self.max_screen_history = 10
         self.client = OpenAI()
+        self.action_queue: List[str] = []
+        self.current_reasoning: ReasoningActionResponse = None
+        self.previous_score: int = 0
 
     def clear_history(self) -> None:
-        """Clear all history when transitioning between levels."""
         self.history = []
         self.screen_history = []
+        self.action_queue = []
+        self.current_reasoning = None
+        self.previous_score = 0
 
     def generate_grid_image_with_zone(
-        self, grid: List[List[int]], cell_size: int = 40
+        self, grid: List[List[int]], cell_size: int = 40, zone_size: int = 20
     ) -> bytes:
-        """Generate PIL image of the grid with colored cells and zone coordinates."""
         if not grid or not grid[0]:
-            # Create empty image
             img = Image.new("RGB", (200, 200), color="black")
             buffer = io.BytesIO()
             img.save(buffer, format="PNG")
             return buffer.getvalue()
-
         height = len(grid)
         width = len(grid[0])
-
-        # Create image
         img = Image.new("RGB", (width * cell_size, height * cell_size), color="white")
         draw = ImageDraw.Draw(img)
-
-        # Color mapping for grid cells
         key_colors = {
-            0: "#FFFFFF",
-            1: "#CCCCCC",
-            2: "#999999",
-            3: "#666666",
-            4: "#333333",
-            5: "#000000",
-            6: "#E53AA3",
-            7: "#FF7BCC",
-            8: "#F93C31",
-            9: "#1E93FF",
-            10: "#88D8F1",
-            11: "#FFDC00",
-            12: "#FF851B",
-            13: "#921231",
-            14: "#4FCC30",
-            15: "#A356D6"
+            0: "#FFFFFF", 1: "#CCCCCC", 2: "#999999", 3: "#666666", 4: "#333333", 5: "#000000",
+            6: "#E53AA3", 7: "#FF7BCC", 8: "#F93C31", 9: "#1E93FF", 10: "#88D8F1", 11: "#FFDC00",
+            12: "#FF851B", 13: "#921231", 14: "#4FCC30", 15: "#A356D6"
         }
-
-        # Draw grid cells
         for y in range(height):
             for x in range(width):
-                color = key_colors.get(grid[y][x], "#888888")  # default: floor
-
-                # Draw cell
+                color = key_colors.get(grid[y][x], "#888888")
                 draw.rectangle(
                     [
                         x * cell_size,
@@ -118,11 +103,8 @@ class ReasoningAgent(ReasoningLLM):
                     outline="#000000",
                     width=1,
                 )
-
-        # Draw zone coordinates and borders
-        for y in range(0, height, self.ZONE_SIZE):
-            for x in range(0, width, self.ZONE_SIZE):
-                # Draw zone coordinate label
+        for y in range(0, height, zone_size):
+            for x in range(0, width, zone_size):
                 try:
                     font = ImageFont.load_default()
                     zone_text = f"({x},{y})"
@@ -136,10 +118,8 @@ class ReasoningAgent(ReasoningLLM):
                     logger.debug(f"Could not load font for zone labels: {e}")
                 except Exception as e:
                     logger.error(f"Failed to draw zone label at ({x},{y}): {e}")
-
-                # Draw zone boundary
-                zone_width = min(self.ZONE_SIZE, width - x) * cell_size
-                zone_height = min(self.ZONE_SIZE, height - y) * cell_size
+                zone_width = min(zone_size, width - x) * cell_size
+                zone_height = min(zone_size, height - y) * cell_size
                 draw.rectangle(
                     [
                         x * cell_size,
@@ -148,23 +128,18 @@ class ReasoningAgent(ReasoningLLM):
                         y * cell_size + zone_height,
                     ],
                     fill=None,
-                    outline="#FFD700",  # gold border for zone
+                    outline="#FFD700",
                     width=2,
                 )
-
-        # Convert to bytes
         buffer = io.BytesIO()
         img.save(buffer, format="PNG")
         return buffer.getvalue()
 
     def build_functions(self) -> list[dict[str, Any]]:
-        """Build JSON function description of game actions for LLM."""
         schema = ReasoningActionResponse.model_json_schema()
-        # The 'name' property is the action to be taken, so we can remove it from the parameters.
         schema["properties"].pop("name", None)
         if "required" in schema:
             schema["required"].remove("name")
-
         functions: list[dict[str, Any]] = [
             {
                 "name": action.name,
@@ -176,13 +151,14 @@ class ReasoningAgent(ReasoningLLM):
                 GameAction.ACTION2,
                 GameAction.ACTION3,
                 GameAction.ACTION4,
+                GameAction.ACTION5,
+                GameAction.ACTION6,
                 GameAction.RESET,
             ]
         ]
         return functions
 
     def build_tools(self) -> list[dict[str, Any]]:
-        """Support models that expect tool_call format."""
         functions = self.build_functions()
         tools: list[dict[str, Any]] = []
         for f in functions:
@@ -198,19 +174,10 @@ class ReasoningAgent(ReasoningLLM):
             )
         return tools
 
-    def build_user_prompt(self, latest_frame: FrameData) -> str:
-        """Build the user prompt for hypothesis-driven exploration."""
+    def build_user_prompt(self, latest_frame: FrameData, score_progress: str = "No score progress detected.") -> str:
         return textwrap.dedent(
-            """
-You are playing a video game.
-
-Your ultimate goal is to understand the rules of the game and explain them to your colleagues.
-
-The game is complex, and may look like an IQ test.
-
-You need to determine how the game works on your own.
-
-To do so, we will provide you with a view of the game corresponding to the bird-eye view of the game, along with the raw grid data.
+            f"""
+You are an agent playing a dynamic video game. You are curious and eager to understand how the game works by interacting with its different objects and elements. Your goal is to WIN and avoid GAME_OVER while minimizing actions.
 
 You can do 5 actions:
 - RESET (used to start a new game or level)
@@ -219,45 +186,54 @@ You can do 5 actions:
 - ACTION3 (MOVE_LEFT)
 - ACTION4 (MOVE_RIGHT)
 
-You can do one action at once.
+After each sequence, always output your reasoning fields in this order:
+0. aggregated_findings: what you have discovered so far about game logic and objects.
+0. victory_hypothesis: your best current theory about how to win the current level/game.
+1. hypothesis: the hypothesis you are about to test. Always make your hypothesis about a **specific object or element** you see in the game (for example: key, door, switch, enemy...).
+2. plan: explain, in natural language, your plan to test this hypothesis (sequence of moves), and clearly state **which object or element you are interacting with and why**.
+3. planned_actions: explicit list of action codes (e.g. ["ACTION3", "ACTION3", "ACTION2", "ACTION5"]).
+4. score_progress: say if your score increased after the last plan, and what caused it.
 
-Every time an action is performed we will provide you with the previous screen and the current screen.
+IMPORTANT:
+- Treat this as an interactive game: be **curious** and try to interact with visible elements to discover their function.
+- After every planned sequence, check if your score increased compared to before the plan.
+- If score increased, explain why you believe it happened.
+- Always update aggregated_findings, hypothesis, and victory_hypothesis after new evidence.
+- **Never propose a plan or hypothesis that is not related to a specific object or element in the game.**
+- Avoid proposing sequences of actions that just move around randomly or repeat the same action without a clear target or goal.
+- If you have already tested all visible elements, try combinations or look for new interactions.
 
-Determine the game rules based on how the game reacted to the previous action (based on the previous screen and the current screen).
+Current score info: {score_progress}
 
-Your goal:
+Example:
+aggregated_findings: "- Keys are collected by stepping on purple tiles. - Doors can only be opened after collecting all keys."
+victory_hypothesis: "Win = collect all keys then open the door with ACTION5."
+hypothesis: "Collecting the purple key will update my inventory and allow the door to be opened."
+plan: "Move three times left, then down, to reach the key; then use interact to try to open the door."
+planned_actions: ["ACTION3", "ACTION3", "ACTION3", "ACTION2", "ACTION5"]
+score_progress: "Score increased from 1 to 2 after the last sequence (due to collecting the key)."
 
-1. Experiment the game to determine how it works based on the screens and your actions.
-2. Analyse the impact of your actions by comparing the screens.
+Your task:
+- Experiment with the game by performing and analyzing sequences of actions, based on your hypothesis and plan.
+- Be curious! Your hypotheses and plans should always involve interacting with objects or elements you can see on the screen.
+- After each sequence, analyze the impact by comparing screens before/after, and by checking score.
+- Summarize and update your findings so your colleagues can learn the rules.
 
-How to proceed:
-1. Define an hypothesis and an action to validate it.
-2. Once confirmed, store the findings. Summarize and aggregate them so that your colleagues can understand the game based on your learning.
-3. Make sure to understand clearly the game rules, energy, walls, doors, keys, etc.
-
-Hint:
-- The game is a 2D platformer.
-- The player can move up, down, left and right.
-- The player has a blue body and an orange head.
-- There are walls in black.
-- The door has a pink border and a shape inside.
-        """
+Remember: Always PLAN a sequence (not a single action), describe it clearly, and list the corresponding planned_actions array.
+"""
         )
 
     def call_llm_with_structured_output(
         self, messages: List[Dict[str, Any]]
     ) -> ReasoningActionResponse:
-        """Call LLM with structured output parsing for reasoning agent."""
         try:
             tools = self.build_tools()
-
             response = self.client.chat.completions.create(
                 model=self.MODEL,
                 messages=messages,
                 tools=tools,
                 tool_choice="required",
             )
-
             self.track_tokens(
                 response.usage.total_tokens, response.choices[0].message.content
             )
@@ -277,22 +253,12 @@ Hint:
             logger.error(f"LLM structured call failed: {e}")
             raise e
 
-    def define_next_action(self, latest_frame: FrameData) -> ReasoningActionResponse:
-        """Define next action for the reasoning agent."""
-        # Generate map image
+    def define_next_action(self, latest_frame: FrameData, score_progress: str = "No score progress detected.") -> ReasoningActionResponse:
         current_grid = latest_frame.frame[-1] if latest_frame.frame else []
         map_image = self.generate_grid_image_with_zone(current_grid)
-
-        # Build messages
-        system_prompt = self.build_user_prompt(latest_frame)
-
-        # Get latest action from history
+        system_prompt = self.build_user_prompt(latest_frame, score_progress)
         latest_action = self.history[-1] if self.history else None
-
-        # Build user message with images
         user_message_content: List[Dict[str, Any]] = []
-
-        # Use the last screen from history as the 'previous_screen'
         previous_screen = self.screen_history[-1] if self.screen_history else None
 
         if previous_screen:
@@ -326,16 +292,13 @@ Hint:
             ]
         )
 
-        # Build messages
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message_content},
         ]
 
-        # Call LLM with structured output
         result = self.call_llm_with_structured_output(messages)
 
-        # Store current screen for next iteration (after using it)
         self.screen_history.append(map_image)
         if len(self.screen_history) > self.max_screen_history:
             self.screen_history.pop(0)
@@ -345,50 +308,71 @@ Hint:
     def choose_action(
         self, frames: List[FrameData], latest_frame: FrameData
     ) -> GameAction:
-        """Choose action using parent class tool calling with reasoning enhancement."""
+        # Détecter progression de score
+        score_progress = "No score progress detected."
+        if hasattr(self, "previous_score"):
+            if latest_frame.score > self.previous_score:
+                score_progress = f"Score increased from {self.previous_score} to {latest_frame.score} after your last sequence."
+            elif latest_frame.score < self.previous_score:
+                score_progress = f"Score decreased from {self.previous_score} to {latest_frame.score} (unexpected, investigate!)."
+        else:
+            self.previous_score = latest_frame.score
+
         if latest_frame.full_reset:
             self.clear_history()
             return GameAction.RESET
 
-        if not self.history:  # First action must be RESET
+        if not self.history:
             action = GameAction.RESET
             initial_response = ReasoningActionResponse(
                 name="RESET",
-                reason="Initial action to start the game and observe the environment.",
-                short_description="Start game",
-                hypothesis="The game requires a RESET to begin.",
                 aggregated_findings="No findings yet.",
+                victory_hypothesis="The game requires a RESET to begin.",
+                hypothesis="The game requires a RESET to begin.",
+                plan="Reset the game to begin exploring the mechanics.",
+                planned_actions=["RESET"],
+                score_progress="No score progress detected."
             )
             self.history.append(initial_response)
+            self.action_queue = []
+            self.current_reasoning = initial_response
+            self.previous_score = latest_frame.score
             return action
 
-        # Define the next action based on reasoning
-        action_response = self.define_next_action(latest_frame)
+        # Si un plan est en cours, on continue
+        if self.action_queue:
+            action_name = self.action_queue.pop(0)
+            action = GameAction.from_name(action_name)
+            action.reasoning = {
+                "plan_in_progress": True,
+                "remaining": self.action_queue.copy(),
+            }
+            self.previous_score = latest_frame.score
+            return action
+
+        # Nouveau plan : score_progress transmis au LLM pour explication !
+        action_response = self.define_next_action(latest_frame, score_progress)
         self.history.append(action_response)
+        self.action_queue = list(action_response.planned_actions)
+        self.current_reasoning = action_response
+        if not self.action_queue:
+            action = GameAction.RESET
+            action.reasoning = {"error": "No planned actions from LLM, forced RESET"}
+            self.current_reasoning = None
+            self.previous_score = latest_frame.score
+            return action
 
-        # Map the reasoning action name to a GameAction
-        action = GameAction.from_name(action_response.name)
-
-        # Create and attach reasoning metadata
-        reasoning_meta = {
-            "model": self.MODEL,
-            "reasoning_effort": self.REASONING_EFFORT,
-            "reasoning_tokens": self._last_reasoning_tokens,
-            "total_reasoning_tokens": self._total_reasoning_tokens,
-            "agent_type": "reasoning_agent",
-            "hypothesis": action_response.hypothesis,
+        # Premier step du nouveau plan : reasoning complet, score_progress
+        action_name = self.action_queue.pop(0)
+        action = GameAction.from_name(action_name)
+        action.reasoning = {
+            "plan": action_response.planned_actions,
             "aggregated_findings": action_response.aggregated_findings,
-            "response_preview": action_response.reason[:200] + "..."
-            if len(action_response.reason) > 200
-            else action_response.reason,
-            "action_chosen": action.name,
-            "game_context": {
-                "score": latest_frame.score,
-                "state": latest_frame.state.name,
-                "action_counter": self.action_counter,
-                "frame_count": len(frames),
-            },
+            "victory_hypothesis": action_response.victory_hypothesis,
+            "hypothesis": action_response.hypothesis,
+            "plan_natural": action_response.plan,
+            "score_progress": score_progress,
+            "plan_in_progress": len(self.action_queue) > 0
         }
-        action.reasoning = reasoning_meta
-
+        self.previous_score = latest_frame.score
         return action
